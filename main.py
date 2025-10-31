@@ -22,12 +22,15 @@ import argparse
 import os
 import time
 import logging
+import sqlite3
+from datetime import datetime
 from bitcoinrpc.authproxy import AuthServiceProxy
 from urllib.parse import urlparse
 
 # Configuration (can be overridden via CLI/env)
 NODE1_RPC_DEFAULT = os.environ.get("NODE1_RPC", "http://user:password@127.0.0.1:8332")
 NODE2_RPC_DEFAULT = os.environ.get("NODE2_RPC", "http://user:password@127.0.0.1:18332")
+DB_PATH_DEFAULT = os.environ.get("DB_PATH", "tx_bridge.db")
 
 # Setup logging
 logging.basicConfig(
@@ -35,6 +38,57 @@ logging.basicConfig(
     format='%(asctime)s %(levelname)s %(name)s - %(message)s'
 )
 logger = logging.getLogger("bridge")
+
+
+# Database functions
+def init_database(db_path: str = DB_PATH_DEFAULT) -> sqlite3.Connection:
+    """Initialize SQLite database and create tables if they don't exist."""
+    conn = sqlite3.connect(db_path)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS transactions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            source_txid TEXT NOT NULL,
+            dest_txid TEXT,
+            block_hash TEXT,
+            block_height INTEGER,
+            tx_index INTEGER,
+            raw_hex TEXT,
+            status TEXT NOT NULL,
+            message TEXT,
+            error_message TEXT
+        )
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_source_txid ON transactions(source_txid)
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_dest_txid ON transactions(dest_txid)
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_block_height ON transactions(block_height)
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_timestamp ON transactions(timestamp)
+    """)
+    conn.commit()
+    logger.info(f"Database initialized at {db_path}")
+    return conn
+
+
+def save_transaction(conn: sqlite3.Connection, source_txid: str, dest_txid: str | None,
+                    block_hash: str | None, block_height: int | None, tx_index: int,
+                    raw_hex: str, status: str, message: str | None, error_message: str | None) -> None:
+    """Save a transaction to the database with its metadata and messages."""
+    timestamp = datetime.utcnow().isoformat()
+    conn.execute("""
+        INSERT INTO transactions 
+        (timestamp, source_txid, dest_txid, block_hash, block_height, tx_index, 
+         raw_hex, status, message, error_message)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (timestamp, source_txid, dest_txid, block_hash, block_height, tx_index,
+          raw_hex, status, message, error_message))
+    conn.commit()
 
 
 def _build_arg_parser():
@@ -67,6 +121,7 @@ within the timeout. Otherwise, it will log a warning and continue.
     
     parser.add_argument("--node1-rpc", default=NODE1_RPC_DEFAULT, help="Node 1 (source) RPC URL")
     parser.add_argument("--node2-rpc", default=NODE2_RPC_DEFAULT, help="Node 2 (destination) RPC URL")
+    parser.add_argument("--db-path", default=DB_PATH_DEFAULT, help=f"SQLite database path (default: {DB_PATH_DEFAULT})")
     parser.add_argument("--log-level", default=os.environ.get("LOG_LEVEL", "INFO"), 
                        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"], help="Logging level")
     return parser
@@ -118,7 +173,7 @@ def test_connections(node1_rpc_url: str, node2_rpc_url: str) -> bool:
     return True
 
 
-def relay_block_transactions(node1_rpc_url: str, node2_rpc_url: str, *, block_height: int | None = None, block_hash: str | None = None) -> dict:
+def relay_block_transactions(node1_rpc_url: str, node2_rpc_url: str, *, block_height: int | None = None, block_hash: str | None = None, db_conn: sqlite3.Connection | None = None) -> dict:
     """Fetch a block from node 1, skip coinbase, and relay txs to node 2.
 
     Returns stats dict with relayed_txids.
@@ -159,11 +214,50 @@ def relay_block_transactions(node1_rpc_url: str, node2_rpc_url: str, *, block_he
             raw_hex = node1.getrawtransaction(txid, False, block_hash)
             sent_txid = node2.sendrawtransaction(raw_hex)
             relayed += 1
-            relayed_txids.append(sent_txid if isinstance(sent_txid, str) else txid)
-            logger.info(f"Relayed tx {txid} -> node 2 txid {sent_txid}")
+            actual_dest_txid = sent_txid if isinstance(sent_txid, str) else txid
+            relayed_txids.append(actual_dest_txid)
+            message = f"Relayed tx {txid} -> node 2 txid {actual_dest_txid}"
+            logger.info(message)
+            
+            # Save to database if connection provided
+            if db_conn:
+                save_transaction(
+                    db_conn,
+                    source_txid=txid,
+                    dest_txid=actual_dest_txid,
+                    block_hash=block_hash,
+                    block_height=block_height,
+                    tx_index=idx,
+                    raw_hex=raw_hex,
+                    status="success",
+                    message=message,
+                    error_message=None
+                )
         except Exception as e:
             failed += 1
-            logger.error(f"Failed to relay tx {txid}: {e}")
+            error_msg = f"Failed to relay tx {txid}: {e}"
+            logger.error(error_msg)
+            
+            # Save failed transaction to database if connection provided
+            if db_conn:
+                try:
+                    # Try to get raw hex even if send failed
+                    raw_hex = node1.getrawtransaction(txid, False, block_hash)
+                except:
+                    raw_hex = ""  # If we can't get raw hex, store empty string
+                
+                save_transaction(
+                    db_conn,
+                    source_txid=txid,
+                    dest_txid=None,
+                    block_hash=block_hash,
+                    block_height=block_height,
+                    tx_index=idx,
+                    raw_hex=raw_hex,
+                    status="failed",
+                    message=None,
+                    error_message=str(e)
+                )
     
     stats = {
         "total": total_candidates,
@@ -176,6 +270,43 @@ def relay_block_transactions(node1_rpc_url: str, node2_rpc_url: str, *, block_he
     }
     logger.info(f"Block relay complete: {relayed} relayed, {failed} failed, {skipped_coinbase} skipped (coinbase)")
     return stats
+
+
+def wait_for_block_creation(node2_rpc_url: str, block_hash: str, *, timeout_seconds: int, poll_interval_seconds: int) -> dict:
+    """Poll node 2 until the block hash exists in its blockchain, or timeout.
+
+    Returns a dict with success status and elapsed time.
+    """
+    node2 = AuthServiceProxy(node2_rpc_url)
+    start_ts = time.time()
+    
+    logger.info(f"Waiting for block {block_hash} to be created on node 2...")
+    
+    while True:
+        try:
+            # Try to get the block - if it exists, this will succeed
+            block_info = node2.getblock(block_hash, 1)
+            if block_info:
+                elapsed = int(time.time() - start_ts)
+                block_height = block_info.get("height", "unknown")
+                logger.info(f"✓ Block {block_hash} found on node 2 at height {block_height} after {elapsed}s")
+                return {"success": True, "elapsed": elapsed, "block_height": block_height}
+        except Exception as e:
+            # Block doesn't exist yet or other error
+            error_msg = str(e).lower()
+            if "block not found" in error_msg or "not found" in error_msg:
+                # Block doesn't exist yet, continue waiting
+                pass
+            else:
+                logger.warning(f"Error checking block on node 2: {e}")
+        
+        elapsed = time.time() - start_ts
+        if elapsed >= timeout_seconds:
+            elapsed_int = int(elapsed)
+            logger.warning(f"✗ Timeout {timeout_seconds}s waiting for block {block_hash} to be created on node 2")
+            return {"success": False, "elapsed": elapsed_int}
+        
+        time.sleep(poll_interval_seconds)
 
 
 def wait_for_mempool_presence(node2_rpc_url: str, candidate_txids: list[str], *, timeout_seconds: int, poll_interval_seconds: int) -> dict:
@@ -216,7 +347,7 @@ def wait_for_mempool_presence(node2_rpc_url: str, candidate_txids: list[str], *,
 
 
 def process_blocks_sequential(node1_rpc_url: str, node2_rpc_url: str, *, start_height: int, end_height: int | None, 
-                             follow: bool, wait_timeout: int, poll_interval: int, strict: bool) -> None:
+                             follow: bool, wait_timeout: int, poll_interval: int, strict: bool, db_conn: sqlite3.Connection | None = None) -> None:
     """Process blocks sequentially, enforcing that transactions appear in node 2 mempool before proceeding."""
     node1 = AuthServiceProxy(node1_rpc_url)
     
@@ -251,33 +382,34 @@ def process_blocks_sequential(node1_rpc_url: str, node2_rpc_url: str, *, start_h
         logger.info(f"{'='*60}")
         
         try:
-            stats = relay_block_transactions(node1_rpc_url, node2_rpc_url, block_height=current)
+            stats = relay_block_transactions(node1_rpc_url, node2_rpc_url, block_height=current, db_conn=db_conn)
+            block_hash = stats.get("block_hash")
             relayed_txids = stats.get("relayed_txids", [])
             blocks_processed += 1
             
-            if not relayed_txids:
-                logger.info("No transactions were relayed (block may only contain coinbase)")
+            if not block_hash:
+                logger.warning(f"Block hash not available for height {current}, skipping block validation")
                 current += 1
                 continue
             
-            # Wait for mempool confirmation before next block
-            wait_info = wait_for_mempool_presence(
+            # Wait for block to be created on node2 before proceeding to next block
+            wait_info = wait_for_block_creation(
                 node2_rpc_url,
-                relayed_txids,
+                block_hash,
                 timeout_seconds=wait_timeout,
                 poll_interval_seconds=poll_interval,
             )
             
             if not wait_info["success"]:
                 if strict:
-                    logger.error(f"Strict mode enabled: stopping due to mempool timeout at block {current}")
+                    logger.error(f"Strict mode enabled: stopping due to block creation timeout at block {current} ({block_hash})")
                     logger.error(f"Processed {blocks_processed} blocks successfully, {blocks_failed} blocks failed")
                     return
                 else:
-                    logger.warning(f"Continuing despite mempool timeout (strict mode disabled)")
+                    logger.warning(f"Continuing despite block creation timeout (strict mode disabled)")
                     blocks_failed += 1
             else:
-                logger.info(f"✓ Block {current} processing complete and validated")
+                logger.info(f"✓ Block {current} ({block_hash}) confirmed created on node 2")
             
         except Exception as e:
             logger.error(f"Error processing block {current}: {e}")
@@ -313,9 +445,13 @@ def main():
     print("Bitcoin Block Bridge (Node 1 -> Node 2)")
     print("=" * 60)
     
+    # Initialize database
+    db_conn = init_database(args.db_path)
+    
     # Test connections
     if not test_connections(args.node1_rpc, args.node2_rpc):
         print("\nPlease fix connection issues before starting bridge")
+        db_conn.close()
         return
     
     # Single block mode
@@ -326,6 +462,7 @@ def main():
             args.node2_rpc,
             block_height=args.block_height,
             block_hash=args.block_hash,
+            db_conn=db_conn,
         )
         relayed_txids = stats.get("relayed_txids", [])
         
@@ -342,22 +479,30 @@ def main():
                 logger.warning("✗ Block processing incomplete (transactions not in mempool)")
         
         print(f"\nBlock relay stats: {stats}")
+        db_conn.close()
         return
     
     # Sequential blocks mode (default/primary mode)
     if args.from_height is not None:
         logger.info("Starting sequential blocks mode")
-        process_blocks_sequential(
-            args.node1_rpc,
-            args.node2_rpc,
-            start_height=args.from_height,
-            end_height=args.to_height,
-            follow=bool(args.follow),
-            wait_timeout=args.wait_timeout,
-            poll_interval=args.poll_interval,
-            strict=bool(args.strict),
-        )
+        try:
+            process_blocks_sequential(
+                args.node1_rpc,
+                args.node2_rpc,
+                start_height=args.from_height,
+                end_height=args.to_height,
+                follow=bool(args.follow),
+                wait_timeout=args.wait_timeout,
+                poll_interval=args.poll_interval,
+                strict=bool(args.strict),
+                db_conn=db_conn,
+            )
+        finally:
+            db_conn.close()
         return
+    
+    # Close database if we reach here
+    db_conn.close()
     
     # No mode specified
     parser.print_help()
