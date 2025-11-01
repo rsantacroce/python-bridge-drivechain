@@ -76,6 +76,38 @@ def init_database(db_path: str = DB_PATH_DEFAULT) -> sqlite3.Connection:
     return conn
 
 
+def check_transaction_sent(conn: sqlite3.Connection, source_txid: str) -> dict | None:
+    """Check if a transaction has been successfully sent before.
+    
+    Returns the most recent successful transaction record if found, None otherwise.
+    Only considers transactions with status 'success' or 'already_in_mempool'.
+    """
+    cursor = conn.execute("""
+        SELECT id, timestamp, source_txid, dest_txid, block_hash, block_height, 
+               tx_index, status, message
+        FROM transactions
+        WHERE source_txid = ? 
+          AND status IN ('success', 'already_in_mempool')
+        ORDER BY timestamp DESC
+        LIMIT 1
+    """, (source_txid,))
+    
+    row = cursor.fetchone()
+    if row:
+        return {
+            "id": row[0],
+            "timestamp": row[1],
+            "source_txid": row[2],
+            "dest_txid": row[3],
+            "block_hash": row[4],
+            "block_height": row[5],
+            "tx_index": row[6],
+            "status": row[7],
+            "message": row[8],
+        }
+    return None
+
+
 def save_transaction(conn: sqlite3.Connection, source_txid: str, dest_txid: str | None,
                     block_hash: str | None, block_height: int | None, tx_index: int,
                     raw_hex: str, status: str, message: str | None, error_message: str | None) -> None:
@@ -193,7 +225,7 @@ def relay_block_transactions(node1_rpc_url: str, node2_rpc_url: str, *, block_he
     txids = block.get("tx", [])
     if not txids:
         logger.warning("Block has no transactions")
-        return {"total": 0, "relayed": 0, "failed": 0, "skipped_coinbase": 0, "already_in_mempool": 0, "relayed_txids": []}
+        return {"total": 0, "relayed": 0, "failed": 0, "skipped_coinbase": 0, "already_in_mempool": 0, "already_sent": 0, "relayed_txids": []}
     
     # Get node2 mempool once at the start
     try:
@@ -208,6 +240,7 @@ def relay_block_transactions(node1_rpc_url: str, node2_rpc_url: str, *, block_he
     failed = 0
     skipped_coinbase = 0
     already_in_mempool = 0
+    already_sent = 0
     total_candidates = 0
     relayed_txids: list[str] = []
     
@@ -218,6 +251,39 @@ def relay_block_transactions(node1_rpc_url: str, node2_rpc_url: str, *, block_he
             continue
         
         total_candidates += 1
+        
+        # Check if transaction was already sent successfully (from database)
+        if db_conn:
+            prev_record = check_transaction_sent(db_conn, txid)
+            if prev_record:
+                already_sent += 1
+                prev_status = prev_record.get("status", "unknown")
+                prev_timestamp = prev_record.get("timestamp", "unknown")
+                prev_block = prev_record.get("block_height", "unknown")
+                message = f"Tx {txid} already sent before (status: {prev_status}, block: {prev_block}, time: {prev_timestamp}), skipping send"
+                logger.info(message)
+                relayed_txids.append(prev_record.get("dest_txid") or txid)
+                
+                # Optionally save a new record referencing the previous send
+                # This allows tracking that we saw this tx again in a new block
+                try:
+                    raw_hex = node1.getrawtransaction(txid, False, block_hash)
+                except:
+                    raw_hex = ""
+                
+                save_transaction(
+                    db_conn,
+                    source_txid=txid,
+                    dest_txid=prev_record.get("dest_txid") or txid,
+                    block_hash=block_hash,
+                    block_height=block_height,
+                    tx_index=idx,
+                    raw_hex=raw_hex,
+                    status="already_sent",
+                    message=message,
+                    error_message=None
+                )
+                continue
         
         # Check if transaction is already in node2's mempool
         if txid in node2_mempool:
@@ -303,11 +369,12 @@ def relay_block_transactions(node1_rpc_url: str, node2_rpc_url: str, *, block_he
         "failed": failed,
         "skipped_coinbase": skipped_coinbase,
         "already_in_mempool": already_in_mempool,
+        "already_sent": already_sent,
         "block_hash": block_hash,
         "block_height": block_height,
         "relayed_txids": relayed_txids,
     }
-    logger.info(f"Block relay complete: {relayed} relayed, {already_in_mempool} already in mempool, {failed} failed, {skipped_coinbase} skipped (coinbase)")
+    logger.info(f"Block relay complete: {relayed} relayed, {already_sent} already sent (from DB), {already_in_mempool} already in mempool, {failed} failed, {skipped_coinbase} skipped (coinbase)")
     return stats
 
 
