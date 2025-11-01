@@ -255,7 +255,8 @@ def relay_block_transactions(node1_rpc_url: str, node2_rpc_url: str, *, block_he
         if block_tx_count and block_tx_count > 1:
             logger.error(f"CRITICAL: Block {block_hash} reports {block_tx_count} transactions but only 1 txid was extracted! Transactions are being lost!")
         else:
-            logger.warning(f"Block {block_hash} only contains coinbase transaction - no transactions to relay")
+            logger.info(f"Block {block_hash} only contains coinbase transaction - skipping block")
+            return {"total": 0, "relayed": 0, "failed": 0, "skipped_coinbase": 1, "already_in_mempool": 0, "already_sent": 0, "relayed_txids": [], "block_hash": block_hash, "block_height": block_height, "coinbase_only": True}
     else:
         logger.info(f"Will process {total_tx_count - 1} non-coinbase transaction(s)")
     
@@ -470,24 +471,41 @@ def wait_for_mempool_presence(node2_rpc_url: str, candidate_txids: list[str], *,
     
     logger.info(f"Waiting for {len(candidate_txids)} transaction(s) to appear in node 2 mempool...")
     
+    # Check if mempool is empty at the start
+    try:
+        initial_mempool = set(node2.getrawmempool())
+        if len(initial_mempool) == 0:
+            logger.info(f"Node 2 mempool is empty - continuing to send more transactions from next block")
+            return {"found": [], "elapsed": 0, "success": False, "mempool_empty": True}
+    except Exception as e:
+        logger.debug(f"Initial mempool check failed: {e}")
+    
     while True:
         try:
             mempool_txids = set(node2.getrawmempool())
+            mempool_size = len(mempool_txids)
         except Exception as e:
             logger.warning(f"Failed to query node 2 mempool: {e}")
             mempool_txids = set()
+            mempool_size = 0
+        
+        # If mempool is empty, return immediately to allow sending more transactions
+        if mempool_size == 0:
+            elapsed = int(time.time() - start_ts)
+            logger.info(f"Node 2 mempool is empty - continuing to send more transactions from next block (waited {elapsed}s)")
+            return {"found": [], "elapsed": elapsed, "success": False, "mempool_empty": True}
         
         found = [txid for txid in candidate_txids if txid in mempool_txids]
         if found:
             elapsed = int(time.time() - start_ts)
             logger.info(f"✓ Found {len(found)}/{len(candidate_txids)} transaction(s) in mempool after {elapsed}s")
-            return {"found": found, "elapsed": elapsed, "success": True}
+            return {"found": found, "elapsed": elapsed, "success": True, "mempool_empty": False}
         
         elapsed = time.time() - start_ts
         if elapsed >= timeout_seconds:
             elapsed_int = int(elapsed)
             logger.warning(f"✗ Timeout {timeout_seconds}s waiting for transactions to appear in mempool (found 0/{len(candidate_txids)})")
-            return {"found": [], "elapsed": elapsed_int, "success": False}
+            return {"found": [], "elapsed": elapsed_int, "success": False, "mempool_empty": False}
         
         time.sleep(poll_interval_seconds)
 
@@ -533,6 +551,12 @@ def process_blocks_sequential(node1_rpc_url: str, node2_rpc_url: str, *, start_h
             relayed_txids = stats.get("relayed_txids", [])
             blocks_processed += 1
             
+            # Skip blocks that only contain coinbase
+            if stats.get("coinbase_only", False):
+                logger.info(f"Skipping block {current} - only contains coinbase, moving to next block")
+                current += 1
+                continue
+            
             if not relayed_txids:
                 logger.info("No transactions were relayed (block may only contain coinbase or all were already sent)")
                 # Wait before processing next block even if no transactions were relayed
@@ -550,7 +574,11 @@ def process_blocks_sequential(node1_rpc_url: str, node2_rpc_url: str, *, start_h
                 poll_interval_seconds=poll_interval,
             )
             
-            if not wait_info["success"]:
+            # If mempool is empty, continue immediately to send more transactions
+            if wait_info.get("mempool_empty", False):
+                logger.info(f"Mempool empty - continuing to next block to send more transactions")
+                # Don't increment blocks_failed, this is expected behavior
+            elif not wait_info["success"]:
                 if strict:
                     logger.error(f"Strict mode enabled: stopping due to mempool timeout at block {current} ({block_hash})")
                     logger.error(f"Processed {blocks_processed} blocks successfully, {blocks_failed} blocks failed")
@@ -624,7 +652,9 @@ def main():
         )
         relayed_txids = stats.get("relayed_txids", [])
         
-        if relayed_txids:
+        if stats.get("coinbase_only", False):
+            logger.info("Block only contains coinbase transaction - nothing to relay")
+        elif relayed_txids:
             wait_info = wait_for_mempool_presence(
                 args.node2_rpc,
                 relayed_txids,
