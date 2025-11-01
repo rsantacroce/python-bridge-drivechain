@@ -228,10 +228,36 @@ def relay_block_transactions(node1_rpc_url: str, node2_rpc_url: str, *, block_he
     
     logger.info(f"Fetching block {block_hash}")
     block = node1.getblock(block_hash, 1)  # verbosity=1 returns txids
-    txids = block.get("tx", [])
+    txids_raw = block.get("tx", [])
+    
+    # Ensure txids is a list
+    if not isinstance(txids_raw, list):
+        logger.error(f"Block 'tx' field is not a list: {type(txids_raw)}. Got: {txids_raw}")
+        txids = []
+    else:
+        txids = txids_raw
+    
+    # Get the actual transaction count from block metadata
+    block_tx_count = block.get("nTx", None)
+    total_tx_count = len(txids) if txids else 0
+    
+    # Verify transaction count matches
+    if block_tx_count is not None and block_tx_count != total_tx_count:
+        logger.error(f"Transaction count mismatch! Block reports nTx={block_tx_count} but extracted {total_tx_count} txids. This may indicate a problem with block data extraction.")
+    
+    logger.info(f"Block contains {total_tx_count} total transaction(s)" + (f" (block reports nTx={block_tx_count})" if block_tx_count else ""))
+    
     if not txids:
         logger.warning("Block has no transactions")
         return {"total": 0, "relayed": 0, "failed": 0, "skipped_coinbase": 0, "already_in_mempool": 0, "already_sent": 0, "relayed_txids": []}
+    
+    if total_tx_count == 1:
+        if block_tx_count and block_tx_count > 1:
+            logger.error(f"CRITICAL: Block {block_hash} reports {block_tx_count} transactions but only 1 txid was extracted! Transactions are being lost!")
+        else:
+            logger.warning(f"Block {block_hash} only contains coinbase transaction - no transactions to relay")
+    else:
+        logger.info(f"Will process {total_tx_count - 1} non-coinbase transaction(s)")
     
     # Get node2 mempool once at the start
     try:
