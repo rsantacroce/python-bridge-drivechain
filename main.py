@@ -5,8 +5,8 @@ Bridge for Bitcoin node instance 1 to Bitcoin node instance 2
 This script fetches blocks from Bitcoin node instance 1 via JSON-RPC,
 skips coinbase transactions, and relays remaining transactions to 
 Bitcoin node instance 2. It enforces block processing rules: it will
-not proceed to the next block until the current block is created/mined
-on instance 2's blockchain.
+not proceed to the next block until relayed transactions appear in
+instance 2's mempool.
 
 Examples:
 - Process blocks from height 850000 to 850100:
@@ -129,9 +129,9 @@ def _build_arg_parser():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 The script enforces block processing rules: it will not proceed to the next block
-until the current block is created/mined on node 2's blockchain.
+until at least one relayed transaction from the current block appears in node 2's mempool.
 
-If --strict is enabled, the script will stop if the block is not created on node 2
+If --strict is enabled, the script will stop if transactions don't appear in mempool
 within the timeout. Otherwise, it will log a warning and continue.
         """
     )
@@ -145,11 +145,11 @@ within the timeout. Otherwise, it will log a warning and continue.
     parser.add_argument("--follow", action="store_true", help="Continue processing new blocks indefinitely")
     
     parser.add_argument("--wait-timeout", type=int, default=int(os.environ.get("WAIT_TIMEOUT", 600)), 
-                       help="Seconds to wait for node 2 to create/mine the block before next block (default: 600)")
+                       help="Seconds to wait for node 2 mempool to receive relayed txs before next block (default: 600)")
     parser.add_argument("--poll-interval", type=int, default=int(os.environ.get("POLL_INTERVAL", 5)), 
-                       help="Seconds between block checks while waiting (default: 5)")
+                       help="Seconds between mempool checks while waiting (default: 5)")
     parser.add_argument("--strict", action="store_true", 
-                       help="Stop processing if block is not created on node 2 within timeout (default: continue with warning)")
+                       help="Stop processing if transactions don't appear in mempool within timeout (default: continue with warning)")
     
     parser.add_argument("--node1-rpc", default=NODE1_RPC_DEFAULT, help="Node 1 (source) RPC URL")
     parser.add_argument("--node2-rpc", default=NODE2_RPC_DEFAULT, help="Node 2 (destination) RPC URL")
@@ -454,7 +454,7 @@ def wait_for_mempool_presence(node2_rpc_url: str, candidate_txids: list[str], *,
 
 def process_blocks_sequential(node1_rpc_url: str, node2_rpc_url: str, *, start_height: int, end_height: int | None, 
                              follow: bool, wait_timeout: int, poll_interval: int, strict: bool, db_conn: sqlite3.Connection | None = None) -> None:
-    """Process blocks sequentially, enforcing that each block is created on node 2 before proceeding to the next block."""
+    """Process blocks sequentially, enforcing that relayed transactions appear in node 2 mempool before proceeding to the next block."""
     node1 = AuthServiceProxy(node1_rpc_url)
     
     current = start_height
@@ -493,29 +493,31 @@ def process_blocks_sequential(node1_rpc_url: str, node2_rpc_url: str, *, start_h
             relayed_txids = stats.get("relayed_txids", [])
             blocks_processed += 1
             
-            if not block_hash:
-                logger.warning(f"Block hash not available for height {current}, skipping block validation")
+            if not relayed_txids:
+                logger.info("No transactions were relayed (block may only contain coinbase or all were already sent)")
                 current += 1
                 continue
             
-            # Wait for block to be created on node2 before proceeding to next block
-            wait_info = wait_for_block_creation(
+            # Wait for transactions to appear in mempool before proceeding to next block
+            wait_info = wait_for_mempool_presence(
                 node2_rpc_url,
-                block_hash,
+                relayed_txids,
                 timeout_seconds=wait_timeout,
                 poll_interval_seconds=poll_interval,
             )
             
             if not wait_info["success"]:
                 if strict:
-                    logger.error(f"Strict mode enabled: stopping due to block creation timeout at block {current} ({block_hash})")
+                    logger.error(f"Strict mode enabled: stopping due to mempool timeout at block {current} ({block_hash})")
                     logger.error(f"Processed {blocks_processed} blocks successfully, {blocks_failed} blocks failed")
                     return
                 else:
-                    logger.warning(f"Continuing despite block creation timeout (strict mode disabled)")
+                    logger.warning(f"Continuing despite mempool timeout (strict mode disabled)")
                     blocks_failed += 1
             else:
-                logger.info(f"✓ Block {current} ({block_hash}) confirmed created on node 2")
+                found_count = len(wait_info.get("found", []))
+                total_count = len(relayed_txids)
+                logger.info(f"✓ Block {current} ({block_hash}): {found_count}/{total_count} transactions confirmed in mempool")
             
         except Exception as e:
             logger.error(f"Error processing block {current}: {e}")
@@ -570,21 +572,23 @@ def main():
             block_hash=args.block_hash,
             db_conn=db_conn,
         )
-        block_hash = stats.get("block_hash")
+        relayed_txids = stats.get("relayed_txids", [])
         
-        if block_hash:
-            wait_info = wait_for_block_creation(
+        if relayed_txids:
+            wait_info = wait_for_mempool_presence(
                 args.node2_rpc,
-                block_hash,
+                relayed_txids,
                 timeout_seconds=args.wait_timeout,
                 poll_interval_seconds=args.poll_interval,
             )
             if wait_info["success"]:
-                logger.info("✓ Block confirmed created on node 2")
+                found_count = len(wait_info.get("found", []))
+                total_count = len(relayed_txids)
+                logger.info(f"✓ Block processing validated: {found_count}/{total_count} transactions in mempool")
             else:
-                logger.warning("✗ Block processing incomplete (block not created on node 2)")
+                logger.warning("✗ Block processing incomplete (transactions not in mempool)")
         else:
-            logger.warning("Block hash not available for validation")
+            logger.info("No transactions were relayed (block may only contain coinbase or all were already sent)")
         
         print(f"\nBlock relay stats: {stats}")
         db_conn.close()
