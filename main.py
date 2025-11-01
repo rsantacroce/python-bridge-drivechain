@@ -31,6 +31,8 @@ from urllib.parse import urlparse
 NODE1_RPC_DEFAULT = os.environ.get("NODE1_RPC", "http://user:password@127.0.0.1:8332")
 NODE2_RPC_DEFAULT = os.environ.get("NODE2_RPC", "http://user:password@127.0.0.1:18332")
 DB_PATH_DEFAULT = os.environ.get("DB_PATH", "tx_bridge.db")
+TX_DELAY_DEFAULT = float(os.environ.get("TX_DELAY", "0.1"))  # Delay in seconds between sending transactions
+BLOCK_DELAY_DEFAULT = float(os.environ.get("BLOCK_DELAY", "1.0"))  # Delay in seconds before processing next block
 
 # Setup logging
 logging.basicConfig(
@@ -148,6 +150,10 @@ within the timeout. Otherwise, it will log a warning and continue.
                        help="Seconds to wait for node 2 mempool to receive relayed txs before next block (default: 600)")
     parser.add_argument("--poll-interval", type=int, default=int(os.environ.get("POLL_INTERVAL", 5)), 
                        help="Seconds between mempool checks while waiting (default: 5)")
+    parser.add_argument("--tx-delay", type=float, default=TX_DELAY_DEFAULT,
+                       help=f"Seconds to wait between sending each transaction (default: {TX_DELAY_DEFAULT})")
+    parser.add_argument("--block-delay", type=float, default=BLOCK_DELAY_DEFAULT,
+                       help=f"Seconds to wait before processing the next block (default: {BLOCK_DELAY_DEFAULT})")
     parser.add_argument("--strict", action="store_true", 
                        help="Stop processing if transactions don't appear in mempool within timeout (default: continue with warning)")
     
@@ -205,7 +211,7 @@ def test_connections(node1_rpc_url: str, node2_rpc_url: str) -> bool:
     return True
 
 
-def relay_block_transactions(node1_rpc_url: str, node2_rpc_url: str, *, block_height: int | None = None, block_hash: str | None = None, db_conn: sqlite3.Connection | None = None) -> dict:
+def relay_block_transactions(node1_rpc_url: str, node2_rpc_url: str, *, block_height: int | None = None, block_hash: str | None = None, db_conn: sqlite3.Connection | None = None, tx_delay: float = 0.0) -> dict:
     """Fetch a block from node 1, skip coinbase, and relay txs to node 2.
 
     Returns stats dict with relayed_txids.
@@ -337,6 +343,10 @@ def relay_block_transactions(node1_rpc_url: str, node2_rpc_url: str, *, block_he
                     message=message,
                     error_message=None
                 )
+            
+            # Wait before sending next transaction
+            if tx_delay > 0:
+                time.sleep(tx_delay)
         except Exception as e:
             failed += 1
             error_msg = f"Failed to relay tx {txid}: {e}"
@@ -362,6 +372,10 @@ def relay_block_transactions(node1_rpc_url: str, node2_rpc_url: str, *, block_he
                     message=None,
                     error_message=str(e)
                 )
+            
+            # Wait before processing next transaction even on failure
+            if tx_delay > 0:
+                time.sleep(tx_delay)
     
     stats = {
         "total": total_candidates,
@@ -453,7 +467,7 @@ def wait_for_mempool_presence(node2_rpc_url: str, candidate_txids: list[str], *,
 
 
 def process_blocks_sequential(node1_rpc_url: str, node2_rpc_url: str, *, start_height: int, end_height: int | None, 
-                             follow: bool, wait_timeout: int, poll_interval: int, strict: bool, db_conn: sqlite3.Connection | None = None) -> None:
+                             follow: bool, wait_timeout: int, poll_interval: int, strict: bool, db_conn: sqlite3.Connection | None = None, tx_delay: float = 0.0, block_delay: float = 0.0) -> None:
     """Process blocks sequentially, enforcing that relayed transactions appear in node 2 mempool before proceeding to the next block."""
     node1 = AuthServiceProxy(node1_rpc_url)
     
@@ -488,13 +502,17 @@ def process_blocks_sequential(node1_rpc_url: str, node2_rpc_url: str, *, start_h
         logger.info(f"{'='*60}")
         
         try:
-            stats = relay_block_transactions(node1_rpc_url, node2_rpc_url, block_height=current, db_conn=db_conn)
+            stats = relay_block_transactions(node1_rpc_url, node2_rpc_url, block_height=current, db_conn=db_conn, tx_delay=tx_delay)
             block_hash = stats.get("block_hash")
             relayed_txids = stats.get("relayed_txids", [])
             blocks_processed += 1
             
             if not relayed_txids:
                 logger.info("No transactions were relayed (block may only contain coinbase or all were already sent)")
+                # Wait before processing next block even if no transactions were relayed
+                if block_delay > 0:
+                    logger.debug(f"Waiting {block_delay}s before processing next block...")
+                    time.sleep(block_delay)
                 current += 1
                 continue
             
@@ -525,6 +543,11 @@ def process_blocks_sequential(node1_rpc_url: str, node2_rpc_url: str, *, start_h
                 logger.error(f"Strict mode enabled: stopping due to error")
                 return
             blocks_failed += 1
+        
+        # Wait before processing next block
+        if block_delay > 0:
+            logger.debug(f"Waiting {block_delay}s before processing next block...")
+            time.sleep(block_delay)
         
         current += 1
     
@@ -571,6 +594,7 @@ def main():
             block_height=args.block_height,
             block_hash=args.block_hash,
             db_conn=db_conn,
+            tx_delay=args.tx_delay,
         )
         relayed_txids = stats.get("relayed_txids", [])
         
@@ -608,6 +632,8 @@ def main():
                 poll_interval=args.poll_interval,
                 strict=bool(args.strict),
                 db_conn=db_conn,
+                tx_delay=args.tx_delay,
+                block_delay=args.block_delay,
             )
         finally:
             db_conn.close()
