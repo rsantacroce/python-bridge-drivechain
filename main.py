@@ -541,14 +541,14 @@ def relay_block_transactions(node1_rpc_url: str, node2_rpc_url: str, *, block_he
     
     if not txids:
         logger.warning("Block has no transactions")
-        return {"total": 0, "relayed": 0, "failed": 0, "skipped_coinbase": 0, "already_on_node2": 0, "already_sent": 0, "confirmed_on_node2": 0, "in_mempool_on_node2": 0, "relayed_txids": []}
+        return {"total": 0, "relayed": 0, "failed": 0, "skipped_coinbase": 0, "already_on_node2": 0, "already_sent": 0, "confirmed_on_node2": 0, "in_mempool_on_node2": 0, "relayed_txids": [], "newly_relayed_txids": []}
     
     if total_tx_count == 1:
         if block_tx_count and block_tx_count > 1:
             logger.error(f"CRITICAL: Block {block_hash} reports {block_tx_count} transactions but only 1 txid was extracted! Transactions are being lost!")
         else:
             logger.info(f"Block {block_hash} only contains coinbase transaction - skipping block")
-            return {"total": 0, "relayed": 0, "failed": 0, "skipped_coinbase": 1, "already_on_node2": 0, "already_sent": 0, "confirmed_on_node2": 0, "in_mempool_on_node2": 0, "relayed_txids": [], "block_hash": block_hash, "block_height": block_height, "coinbase_only": True}
+            return {"total": 0, "relayed": 0, "failed": 0, "skipped_coinbase": 1, "already_on_node2": 0, "already_sent": 0, "confirmed_on_node2": 0, "in_mempool_on_node2": 0, "relayed_txids": [], "newly_relayed_txids": [], "block_hash": block_hash, "block_height": block_height, "coinbase_only": True}
     else:
         logger.info(f"Will process {total_tx_count - 1} non-coinbase transaction(s)")
     
@@ -633,6 +633,7 @@ def relay_block_transactions(node1_rpc_url: str, node2_rpc_url: str, *, block_he
             relayed += 1
             actual_dest_txid = sent_txid if isinstance(sent_txid, str) else txid
             relayed_txids.append(actual_dest_txid)
+            newly_relayed_txids.append(actual_dest_txid)  # Only add newly sent transactions
             message = f"Relayed tx {txid} -> node 2 txid {actual_dest_txid}"
             logger.info(message)
             
@@ -700,6 +701,7 @@ def relay_block_transactions(node1_rpc_url: str, node2_rpc_url: str, *, block_he
         "block_hash": block_hash,
         "block_height": block_height,
         "relayed_txids": relayed_txids,
+        "newly_relayed_txids": newly_relayed_txids,  # Only transactions we actually sent
     }
     logger.info(f"Block relay complete: {relayed} relayed, {already_on_node2} already on node2 ({confirmed_on_node2} confirmed, {in_mempool_on_node2} in mempool), {failed} failed, {skipped_coinbase} skipped (coinbase)")
     return stats
@@ -840,6 +842,7 @@ def process_blocks_sequential(node1_rpc_url: str, node2_rpc_url: str, *, start_h
             stats = relay_block_transactions(node1_rpc_url, node2_rpc_url, block_height=current, db_conn=db_conn, tx_delay=tx_delay)
             block_hash = stats.get("block_hash")
             relayed_txids = stats.get("relayed_txids", [])
+            newly_relayed_txids = stats.get("newly_relayed_txids", [])
             blocks_processed += 1
             
             # Skip blocks that only contain coinbase
@@ -848,8 +851,13 @@ def process_blocks_sequential(node1_rpc_url: str, node2_rpc_url: str, *, start_h
                 current += 1
                 continue
             
-            if not relayed_txids:
-                logger.info("No transactions were relayed (block may only contain coinbase or all were already sent)")
+            # Only wait for mempool if we actually sent new transactions
+            # If all transactions were already on node2, skip the mempool wait
+            if not newly_relayed_txids:
+                if stats.get("relayed", 0) == 0:
+                    logger.info("No transactions were relayed (block may only contain coinbase or all were already on node2)")
+                else:
+                    logger.info(f"All transactions were already on node2 ({stats.get('already_on_node2', 0)} confirmed) - skipping mempool wait")
                 # Wait before processing next block even if no transactions were relayed
                 if block_delay > 0:
                     logger.debug(f"Waiting {block_delay}s before processing next block...")
@@ -857,10 +865,10 @@ def process_blocks_sequential(node1_rpc_url: str, node2_rpc_url: str, *, start_h
                 current += 1
                 continue
             
-            # Wait for transactions to appear in mempool before proceeding to next block
+            # Wait for newly relayed transactions to appear in mempool before proceeding to next block
             wait_info = wait_for_mempool_presence(
                 node2_rpc_url,
-                relayed_txids,
+                newly_relayed_txids,
                 timeout_seconds=wait_timeout,
                 poll_interval_seconds=poll_interval,
             )
@@ -879,8 +887,8 @@ def process_blocks_sequential(node1_rpc_url: str, node2_rpc_url: str, *, start_h
                     blocks_failed += 1
             else:
                 found_count = len(wait_info.get("found", []))
-                total_count = len(relayed_txids)
-                logger.info(f"✓ Block {current} ({block_hash}): {found_count}/{total_count} transactions confirmed in mempool")
+                total_count = len(newly_relayed_txids)
+                logger.info(f"✓ Block {current} ({block_hash}): {found_count}/{total_count} newly relayed transactions confirmed in mempool")
             
         except Exception as e:
             logger.error(f"Error processing block {current}: {e}")
@@ -967,24 +975,29 @@ def main():
             tx_delay=args.tx_delay,
         )
         relayed_txids = stats.get("relayed_txids", [])
+        newly_relayed_txids = stats.get("newly_relayed_txids", [])
         
         if stats.get("coinbase_only", False):
             logger.info("Block only contains coinbase transaction - nothing to relay")
-        elif relayed_txids:
+        elif newly_relayed_txids:
+            # Only wait for mempool if we actually sent new transactions
             wait_info = wait_for_mempool_presence(
                 args.node2_rpc,
-                relayed_txids,
+                newly_relayed_txids,
                 timeout_seconds=args.wait_timeout,
                 poll_interval_seconds=args.poll_interval,
             )
             if wait_info["success"]:
                 found_count = len(wait_info.get("found", []))
-                total_count = len(relayed_txids)
-                logger.info(f"✓ Block processing validated: {found_count}/{total_count} transactions in mempool")
+                total_count = len(newly_relayed_txids)
+                logger.info(f"✓ Block processing validated: {found_count}/{total_count} newly relayed transactions in mempool")
             else:
-                logger.warning("✗ Block processing incomplete (transactions not in mempool)")
+                logger.warning("✗ Block processing incomplete (newly relayed transactions not in mempool)")
         else:
-            logger.info("No transactions were relayed (block may only contain coinbase or all were already sent)")
+            if stats.get("relayed", 0) == 0:
+                logger.info("No transactions were relayed (block may only contain coinbase or all were already on node2)")
+            else:
+                logger.info(f"All transactions were already on node2 ({stats.get('already_on_node2', 0)} confirmed) - skipping mempool wait")
         
         print(f"\nBlock relay stats: {stats}")
         db_conn.close()
