@@ -204,67 +204,101 @@ def check_transaction_on_node2(node2_rpc_url: str, txid: str, electrum_server_ur
 def check_transaction_sent(conn: sqlite3.Connection, source_txid: str, node2_rpc_url: str | None = None) -> dict | None:
     """Check if a transaction has been successfully sent before.
     
-    Performs two checks:
-    1. Checks if the transaction is on node2 blockchain/mempool (CRITICAL - prevents duplicate sends)
-    2. Checks if the transaction exists in the database and updates it with blockchain data
+    Performs optimized checks:
+    1. First checks database (fast) - if confirmed (>=1), returns immediately without API call
+    2. If not in DB or not confirmed, checks node2 blockchain/mempool (CRITICAL - prevents duplicate sends)
+    3. Updates database only when necessary (not if already confirmed)
     
     Returns the most recent successful transaction record if found, None otherwise.
     Only considers transactions with status 'success' or 'already_in_mempool'.
     """
-    # FIRST: Check if transaction is on node2 (most important check)
+    # FIRST: Check database (fast path - avoids API call if already confirmed)
+    cursor = conn.execute("""
+        SELECT id, timestamp, source_txid, dest_txid, block_hash, block_height, 
+               tx_index, status, message, confirmations
+        FROM transactions
+        WHERE source_txid = ? 
+          AND status IN ('success', 'already_in_mempool', 'already_sent')
+        ORDER BY timestamp DESC
+        LIMIT 1
+    """, (source_txid,))
+    
+    row = cursor.fetchone()
+    
+    # If found in database and already confirmed (>=1), return immediately (performance optimization)
+    if row:
+        existing_confirmations = row[9] if row[9] is not None else 0
+        if existing_confirmations >= 1:
+            # Already confirmed - skip API call and return cached result
+            return {
+                "id": row[0],
+                "timestamp": row[1],
+                "source_txid": row[2],
+                "dest_txid": row[3],
+                "block_hash": row[4],
+                "block_height": row[5],
+                "tx_index": row[6],
+                "status": row[7],
+                "message": row[8],
+                "confirmations": existing_confirmations,
+                "on_node2": True,  # If confirmed, it's definitely on node2
+            }
+    
+    # SECOND: Check if transaction is on node2 (only if not confirmed in DB)
+    # This is the critical check - we MUST check node2 to avoid duplicate sends
+    node2_info = None
     if node2_rpc_url:
         node2_info = check_transaction_on_node2(node2_rpc_url, source_txid)
         if node2_info:
             # Transaction exists on node2 - don't send!
             logger.info(f"Transaction {source_txid} already exists on node2 (confirmed: {node2_info.get('confirmed', False)}, confirmations: {node2_info.get('confirmations', 0)})")
             
-            # Check database for existing record
-            cursor = conn.execute("""
-                SELECT id, timestamp, source_txid, dest_txid, block_hash, block_height, 
-                       tx_index, status, message, confirmations
-                FROM transactions
-                WHERE source_txid = ? 
-                  AND status IN ('success', 'already_in_mempool', 'already_sent')
-                ORDER BY timestamp DESC
-                LIMIT 1
-            """, (source_txid,))
+            # Ensure confirmations is never None for comparisons
+            confirmations = node2_info.get("confirmations") or 0
+            if confirmations is None:
+                confirmations = 0
             
-            row = cursor.fetchone()
             if row:
-                # Update existing record with latest node2 info
-                record_id = row[0]
-                update_data = []
-                update_fields = []
+                # Update existing record only if confirmations increased or not yet confirmed
+                existing_confirmations = row[9] if row[9] is not None else 0
+                should_update = confirmations < 1 or confirmations > existing_confirmations
                 
-                confirmations = node2_info.get("confirmations", 0)
-                block_hash = node2_info.get("block_hash")
-                block_height = node2_info.get("block_height")
-                tx_index = node2_info.get("tx_index")
-                
-                if confirmations is not None:
-                    update_fields.append("confirmations = ?")
-                    update_data.append(confirmations)
-                
-                if block_hash:
-                    update_fields.append("block_hash = ?")
-                    update_data.append(block_hash)
-                
-                if block_height is not None:
-                    update_fields.append("block_height = ?")
-                    update_data.append(block_height)
-                
-                if tx_index is not None:
-                    update_fields.append("tx_index = ?")
-                    update_data.append(tx_index)
-                
-                if update_fields:
-                    update_data.append(record_id)
-                    conn.execute(f"""
-                        UPDATE transactions
-                        SET {', '.join(update_fields)}
-                        WHERE id = ?
-                    """, update_data)
-                    conn.commit()
+                if should_update:
+                    record_id = row[0]
+                    update_data = []
+                    update_fields = []
+                    
+                    block_hash = node2_info.get("block_hash")
+                    block_height = node2_info.get("block_height")
+                    tx_index = node2_info.get("tx_index")
+                    
+                    if confirmations is not None:
+                        update_fields.append("confirmations = ?")
+                        update_data.append(confirmations)
+                    
+                    if block_hash:
+                        update_fields.append("block_hash = ?")
+                        update_data.append(block_hash)
+                    
+                    if block_height is not None:
+                        update_fields.append("block_height = ?")
+                        update_data.append(block_height)
+                    
+                    if tx_index is not None:
+                        update_fields.append("tx_index = ?")
+                        update_data.append(tx_index)
+                    
+                    if update_fields:
+                        update_data.append(record_id)
+                        conn.execute(f"""
+                            UPDATE transactions
+                            SET {', '.join(update_fields)}
+                            WHERE id = ?
+                        """, update_data)
+                        conn.commit()
+                else:
+                    # Use existing confirmations value
+                    confirmations = existing_confirmations
                 
                 # Return updated record
                 return {
@@ -272,12 +306,12 @@ def check_transaction_sent(conn: sqlite3.Connection, source_txid: str, node2_rpc
                     "timestamp": row[1],
                     "source_txid": row[2],
                     "dest_txid": row[3],
-                    "block_hash": block_hash or row[4],
-                    "block_height": block_height if block_height is not None else row[5],
-                    "tx_index": tx_index if tx_index is not None else row[6],
+                    "block_hash": node2_info.get("block_hash") or row[4],
+                    "block_height": node2_info.get("block_height") if node2_info.get("block_height") is not None else row[5],
+                    "tx_index": node2_info.get("tx_index") if node2_info.get("tx_index") is not None else row[6],
                     "status": row[7],
                     "message": row[8],
-                    "confirmations": confirmations if confirmations is not None else row[9],
+                    "confirmations": confirmations,
                     "on_node2": True,
                 }
             else:
@@ -292,88 +326,91 @@ def check_transaction_sent(conn: sqlite3.Connection, source_txid: str, node2_rpc
                     "tx_index": node2_info.get("tx_index"),
                     "status": "already_on_node2",
                     "message": f"Transaction exists on node2 (not in our database yet)",
-                    "confirmations": node2_info.get("confirmations", 0),
+                    "confirmations": node2_info.get("confirmations") or 0,
                     "on_node2": True,
                 }
     
-    # SECOND: Check database for historical record
-    cursor = conn.execute("""
-        SELECT id, timestamp, source_txid, dest_txid, block_hash, block_height, 
-               tx_index, status, message, confirmations
-        FROM transactions
-        WHERE source_txid = ? 
-          AND status IN ('success', 'already_in_mempool')
-        ORDER BY timestamp DESC
-        LIMIT 1
-    """, (source_txid,))
-    
-    row = cursor.fetchone()
-    if not row:
-        return None
-    
-    # Build the record from database
-    record = {
-        "id": row[0],
-        "timestamp": row[1],
-        "source_txid": row[2],
-        "dest_txid": row[3],
-        "block_hash": row[4],
-        "block_height": row[5],
-        "tx_index": row[6],
-        "status": row[7],
-        "message": row[8],
-        "confirmations": row[9],
-    }
-    
-    # Update database with node2 blockchain info if available
-    if node2_rpc_url:
-        node2_info = check_transaction_on_node2(node2_rpc_url, record.get("dest_txid") or source_txid)
-        if node2_info:
-            update_data = []
-            update_fields = []
-            
-            confirmations = node2_info.get("confirmations", 0)
-            block_hash = node2_info.get("block_hash")
-            block_height = node2_info.get("block_height")
-            tx_index = node2_info.get("tx_index")
-            
-            if confirmations is not None:
-                update_fields.append("confirmations = ?")
-                update_data.append(confirmations)
-            
-            if block_hash:
-                update_fields.append("block_hash = ?")
-                update_data.append(block_hash)
-            
-            if block_height is not None:
-                update_fields.append("block_height = ?")
-                update_data.append(block_height)
-            
-            if tx_index is not None:
-                update_fields.append("tx_index = ?")
-                update_data.append(tx_index)
-            
-            if update_fields:
-                update_data.append(record["id"])
-                conn.execute(f"""
-                    UPDATE transactions
-                    SET {', '.join(update_fields)}
-                    WHERE id = ?
-                """, update_data)
-                conn.commit()
+    # THIRD: If we found a record in DB but it's not on node2, return it
+    if row:
+        record = {
+            "id": row[0],
+            "timestamp": row[1],
+            "source_txid": row[2],
+            "dest_txid": row[3],
+            "block_hash": row[4],
+            "block_height": row[5],
+            "tx_index": row[6],
+            "status": row[7],
+            "message": row[8],
+            "confirmations": row[9],
+            "on_node2": False,
+        }
+        
+        # Only update from node2 if not yet confirmed (performance optimization)
+        record_confirmations = record.get("confirmations")
+        if record_confirmations is None:
+            record_confirmations = 0
+        if node2_rpc_url and record_confirmations < 1:
+            node2_info = check_transaction_on_node2(node2_rpc_url, record.get("dest_txid") or source_txid)
+            if node2_info:
+                update_data = []
+                update_fields = []
                 
-                # Update the record dict
-                record["confirmations"] = confirmations
-                if block_hash:
-                    record["block_hash"] = block_hash
-                if block_height is not None:
-                    record["block_height"] = block_height
-                if tx_index is not None:
-                    record["tx_index"] = tx_index
+                # Ensure confirmations is never None for comparisons
+                confirmations = node2_info.get("confirmations") or 0
+                if confirmations is None:
+                    confirmations = 0
+                existing_confirmations = record.get("confirmations") or 0
+                if existing_confirmations is None:
+                    existing_confirmations = 0
                 
-                logger.debug(f"Updated transaction {source_txid} in database: confirmations={confirmations}, block_height={block_height}")
+                # Only update if confirmations increased or not yet confirmed
+                if confirmations > existing_confirmations or confirmations < 1:
+                    block_hash = node2_info.get("block_hash")
+                    block_height = node2_info.get("block_height")
+                    tx_index = node2_info.get("tx_index")
+                    
+                    if confirmations is not None:
+                        update_fields.append("confirmations = ?")
+                        update_data.append(confirmations)
+                    
+                    if block_hash:
+                        update_fields.append("block_hash = ?")
+                        update_data.append(block_hash)
+                    
+                    if block_height is not None:
+                        update_fields.append("block_height = ?")
+                        update_data.append(block_height)
+                    
+                    if tx_index is not None:
+                        update_fields.append("tx_index = ?")
+                        update_data.append(tx_index)
+                    
+                    if update_fields:
+                        update_data.append(record["id"])
+                        conn.execute(f"""
+                            UPDATE transactions
+                            SET {', '.join(update_fields)}
+                            WHERE id = ?
+                        """, update_data)
+                        conn.commit()
+                        
+                        # Update the record dict
+                        record["confirmations"] = confirmations
+                        record["on_node2"] = True
+                        if block_hash:
+                            record["block_hash"] = block_hash
+                        if block_height is not None:
+                            record["block_height"] = block_height
+                        if tx_index is not None:
+                            record["tx_index"] = tx_index
+                        
+                        logger.debug(f"Updated transaction {source_txid} in database: confirmations={confirmations}, block_height={block_height}")
+        
+        return record
     
-    return record
+    # Not found anywhere
+    return None
 
 
 def save_transaction(conn: sqlite3.Connection, source_txid: str, dest_txid: str | None,
@@ -586,7 +623,10 @@ def relay_block_transactions(node1_rpc_url: str, node2_rpc_url: str, *, block_he
             
             # Check if it's confirmed on node2
             if prev_record.get("on_node2"):
-                if prev_record.get("confirmations", 0) > 0:
+                prev_confirmations_val = prev_record.get("confirmations")
+                if prev_confirmations_val is None:
+                    prev_confirmations_val = 0
+                if prev_confirmations_val > 0:
                     confirmed_on_node2 += 1
                 else:
                     in_mempool_on_node2 += 1
@@ -596,7 +636,10 @@ def relay_block_transactions(node1_rpc_url: str, node2_rpc_url: str, *, block_he
             prev_block = prev_record.get("block_height", "unknown")
             
             if prev_record.get("on_node2"):
-                is_confirmed = prev_record.get("confirmations", 0) > 0
+                prev_confirmations_check = prev_record.get("confirmations")
+                if prev_confirmations_check is None:
+                    prev_confirmations_check = 0
+                is_confirmed = prev_confirmations_check > 0
                 message = f"Tx {txid} already on node2 (confirmed: {is_confirmed}, confirmations: {prev_confirmations}, block: {prev_block}), skipping send"
             else:
                 message = f"Tx {txid} already sent before (status: {prev_status}, block: {prev_block}), skipping send"
@@ -605,7 +648,17 @@ def relay_block_transactions(node1_rpc_url: str, node2_rpc_url: str, *, block_he
             # Add to relayed_txids for tracking, but NOT to newly_relayed_txids (already on node2)
             relayed_txids.append(prev_record.get("dest_txid") or txid)
             
-            # Save a new record if we saw this tx again (allows tracking)
+            # Skip database write if transaction already has >=1 confirmations (performance optimization)
+            # Ensure confirmations is never None for comparisons
+            confirmations = prev_record.get("confirmations")
+            if confirmations is None:
+                confirmations = 0
+            if confirmations >= 1:
+                logger.debug(f"Skipping database write for {txid} - already confirmed ({confirmations} confirmations)")
+                continue
+            
+            # Save a new record if we saw this tx again and it's not yet confirmed (allows tracking)
+            # Only write if transaction is not yet confirmed to avoid unnecessary writes
             if db_conn:
                 try:
                     raw_hex = node1.getrawtransaction(txid, False, block_hash)
@@ -656,34 +709,72 @@ def relay_block_transactions(node1_rpc_url: str, node2_rpc_url: str, *, block_he
             if tx_delay > 0:
                 time.sleep(tx_delay)
         except Exception as e:
-            failed += 1
-            error_msg = f"Failed to relay tx {txid}: {e}"
-            logger.error(error_msg)
+            error_str = str(e)
             
-            # Save failed transaction to database if connection provided
-            if db_conn:
-                try:
-                    # Try to get raw hex even if send failed
-                    raw_hex = node1.getrawtransaction(txid, False, block_hash)
-                except:
-                    raw_hex = ""  # If we can't get raw hex, store empty string
+            # Handle known "already exists" errors - these mean transaction is already in blockchain
+            # RPC error -27: Transaction outputs already in utxo set
+            # RPC error -25: Transaction already in block chain
+            if "already in" in error_str.lower() or "already exists" in error_str.lower() or "-27" in error_str or "-25" in error_str:
+                already_on_node2 += 1
+                confirmed_on_node2 += 1  # If in utxo set, it's confirmed
+                relayed_txids.append(txid)  # Add to tracking
+                message = f"Tx {txid} already exists in node2 blockchain (UTXO set), skipping"
+                logger.info(message)
                 
-                save_transaction(
-                    db_conn,
-                    source_txid=txid,
-                    dest_txid=None,
-                    block_hash=block_hash,
-                    block_height=block_height,
-                    tx_index=idx,
-                    raw_hex=raw_hex,
-                    status="failed",
-                    message=None,
-                    error_message=str(e)
-                )
-            
-            # Wait before processing next transaction even on failure
-            if tx_delay > 0:
-                time.sleep(tx_delay)
+                # Save as already_sent if connection provided
+                if db_conn:
+                    try:
+                        # Try to get raw hex for tracking
+                        raw_hex = node1.getrawtransaction(txid, False, block_hash)
+                    except:
+                        raw_hex = ""
+                    
+                    save_transaction(
+                        db_conn,
+                        source_txid=txid,
+                        dest_txid=txid,
+                        block_hash=block_hash,
+                        block_height=block_height,
+                        tx_index=idx,
+                        raw_hex=raw_hex,
+                        status="already_sent",
+                        message=message,
+                        error_message=None
+                    )
+                
+                # Wait before processing next transaction
+                if tx_delay > 0:
+                    time.sleep(tx_delay)
+            else:
+                # Real failure - transaction couldn't be sent
+                failed += 1
+                error_msg = f"Failed to relay tx {txid}: {e}"
+                logger.error(error_msg)
+                
+                # Save failed transaction to database if connection provided
+                if db_conn:
+                    try:
+                        # Try to get raw hex even if send failed
+                        raw_hex = node1.getrawtransaction(txid, False, block_hash)
+                    except:
+                        raw_hex = ""  # If we can't get raw hex, store empty string
+                    
+                    save_transaction(
+                        db_conn,
+                        source_txid=txid,
+                        dest_txid=None,
+                        block_hash=block_hash,
+                        block_height=block_height,
+                        tx_index=idx,
+                        raw_hex=raw_hex,
+                        status="failed",
+                        message=None,
+                        error_message=str(e)
+                    )
+                
+                # Wait before processing next transaction even on failure
+                if tx_delay > 0:
+                    time.sleep(tx_delay)
     
     # Log summary of transactions already on node2
     if already_on_node2 > 0:
