@@ -1,36 +1,25 @@
-# Python TX Bridge (Drivechain to Fork)
+# Python TX Bridge (Bitcoin Node 1 -> Node 2)
 
-Relays Bitcoin mainnet (Drivechain) transactions to a fork chain.
+Relays Bitcoin transactions from one Bitcoin node instance to another using JSON-RPC.
 
-- Stream mode: subscribe to ZMQ and forward incoming rawtx to the fork
-- Block mode: fetch a specific block, skip coinbase, relay remaining txs
-- Sequential mode: process blocks from a starting height (optional end height or follow tip), waiting for relayed txs to appear in the fork mempool before continuing
+This script fetches blocks from Bitcoin node instance 1, skips coinbase transactions, and relays the remaining transactions to Bitcoin node instance 2. It enforces strict block processing rules: **it will not proceed to the next block until at least one relayed transaction appears in node 2's mempool**.
 
 ## Prerequisites
 - Python 3.9+
-- Bitcoin Core (source/mainnet side) with RPC and ZMQ enabled
-- Fork node with RPC enabled
+- Bitcoin Core node instance 1 (source) with RPC enabled
+- Bitcoin Core node instance 2 (destination) with RPC enabled
 
-Example bitcoin.conf (source/mainnet side):
+Example bitcoin.conf for both nodes:
 ```
 server=1
 rpcuser=user
-rpcpassword=passwordDC
-# ZMQ publisher sockets
-zmqpubrawtx=tcp://127.0.0.1:29000
-```
-
-Fork node should have RPC enabled similarly:
-```
-server=1
-rpcuser=user
-rpcpassword=forkpassword
+rpcpassword=password
 ```
 
 ## Install
 ```
-python3 -m venv .venv
-source .venv/bin/activate
+python3 -m venv venv
+source venv/bin/activate
 pip install -r requirements.txt
 ```
 
@@ -38,30 +27,43 @@ pip install -r requirements.txt
 Configure via CLI or environment variables.
 
 Environment variables (optional):
-- MAINNET_RPC (default: http://user:passwordDC@127.0.0.1:8332)
-- MAINNET_ZMQ (default: tcp://127.0.0.1:29000)
-- FORK_RPC (default: http://user:forkpassword@127.0.0.1:18332)
-- LOG_LEVEL (default: INFO)
-- WAIT_TIMEOUT (default: 600 seconds)
-- POLL_INTERVAL (default: 5 seconds)
+- `NODE1_RPC` (default: `http://user:password@127.0.0.1:8332`) - Source Bitcoin node
+- `NODE2_RPC` (default: `http://user:password@127.0.0.1:18332`) - Destination Bitcoin node
+- `LOG_LEVEL` (default: `INFO`)
+- `WAIT_TIMEOUT` (default: 600 seconds) - Time to wait for transactions to appear in mempool
+- `POLL_INTERVAL` (default: 5 seconds) - How often to check mempool
 
-CLI flags override envs:
-- --mainnet-rpc URL
-- --mainnet-zmq ADDR
-- --fork-rpc URL
-- --log-level {DEBUG,INFO,WARNING,ERROR,CRITICAL}
+CLI flags override environment variables:
+- `--node1-rpc URL` - Source node RPC URL
+- `--node2-rpc URL` - Destination node RPC URL
+- `--log-level {DEBUG,INFO,WARNING,ERROR,CRITICAL}`
+- `--wait-timeout SECONDS` - Mempool wait timeout
+- `--poll-interval SECONDS` - Mempool polling interval
+- `--strict` - Stop processing if transactions don't appear in mempool (default: continue with warning)
 
 ## Usage
 All commands assume you are in the project root and the venv is activated.
 
-### Stream mode (default)
-Relays incoming raw transactions from ZMQ to the fork.
+### Sequential blocks mode (primary mode)
+Process blocks sequentially with mempool validation. The script will not proceed to the next block until relayed transactions appear in node 2's mempool.
+
 ```
-./main.py
+# Process a range of blocks
+./main.py --from-height 850000 --to-height 850100
+
+# Start at a height and follow new blocks indefinitely
+./main.py --from-height 850000 --follow
+
+# Tune wait timeout and polling interval
+./main.py --from-height 850000 --wait-timeout 300 --poll-interval 3
+
+# Enable strict mode (stop if transactions don't appear in mempool)
+./main.py --from-height 850000 --strict
 ```
 
 ### Single block mode
-Fetch a block from mainnet RPC, skip coinbase, relay remaining txs. Then wait (up to timeout) for at least one relayed tx to appear in the fork mempool.
+Process a single block and validate that transactions appear in mempool:
+
 ```
 # By height
 ./main.py --block-height 850000
@@ -70,21 +72,17 @@ Fetch a block from mainnet RPC, skip coinbase, relay remaining txs. Then wait (u
 ./main.py --block-hash 0000000000000000000abcdef0123456789...
 ```
 
-### Sequential blocks mode
-Process a range or follow new blocks indefinitely. After each block, the tool polls the fork mempool until any relayed tx appears or the timeout elapses before proceeding.
-```
-# Fixed range
-./main.py --from-height 850000 --to-height 850010
+## Block Processing Rules
 
-# Start and follow new blocks forever
-./main.py --from-height 850000 --follow
+The script enforces the following rules:
 
-# Tune wait window and polling cadence
-./main.py --from-height 850000 --wait-timeout 600 --poll-interval 5
-```
+1. **Coinbase transactions are skipped** (first transaction in each block)
+2. **Mempool validation**: Before proceeding to the next block, the script waits (up to `--wait-timeout` seconds) for at least one relayed transaction to appear in node 2's mempool
+3. **Strict mode**: If `--strict` is enabled and transactions don't appear in mempool within the timeout, processing stops. Otherwise, a warning is logged and processing continues
 
 ## Notes
-- Coinbase transactions are ignored.
-- If no relayed tx is observed in the fork mempool within the timeout window, processing continues to the next block with a warning.
-- Use --log-level DEBUG for detailed trace logging.
-
+- Coinbase transactions are always ignored
+- The script polls node 2's mempool to ensure transactions were successfully relayed
+- If no transactions were relayed from a block (e.g., only coinbase), the script proceeds immediately to the next block
+- Use `--log-level DEBUG` for detailed trace logging
+- ZMQ functionality will be added in a future version
